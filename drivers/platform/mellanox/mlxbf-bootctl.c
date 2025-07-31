@@ -333,9 +333,9 @@ static ssize_t secure_boot_fuse_state_show(struct device *dev,
 			else
 				status = valid ? "Invalid" : "Free";
 		}
-		buf_len += sysfs_emit(buf + buf_len, "%d:%s ", key, status);
+		buf_len += sysfs_emit_at(buf, buf_len, "%d:%s ", key, status);
 	}
-	buf_len += sysfs_emit(buf + buf_len, "\n");
+	buf_len += sysfs_emit_at(buf, buf_len, "\n");
 
 	return buf_len;
 }
@@ -993,7 +993,7 @@ static ssize_t mlxbf_bootctl_bootfifo_read(struct file *filp,
 
 static const struct bin_attribute mlxbf_bootctl_bootfifo_sysfs_attr = {
 	.attr = { .name = "bootfifo", .mode = 0400 },
-	.read_new = mlxbf_bootctl_bootfifo_read,
+	.read = mlxbf_bootctl_bootfifo_read,
 };
 
 static bool mlxbf_bootctl_guid_match(const guid_t *guid,

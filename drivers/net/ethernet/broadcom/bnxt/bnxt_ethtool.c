@@ -26,7 +26,7 @@
 #include <linux/timecounter.h>
 #include <net/netdev_queues.h>
 #include <net/netlink.h>
-#include "bnxt_hsi.h"
+#include <linux/bnxt/hsi.h>
 #include "bnxt.h"
 #include "bnxt_hwrm.h"
 #include "bnxt_ulp.h"
@@ -1587,8 +1587,11 @@ static u64 get_ethtool_ipv6_rss(struct bnxt *bp)
 	return 0;
 }
 
-static int bnxt_grxfh(struct bnxt *bp, struct ethtool_rxnfc *cmd)
+static int bnxt_get_rxfh_fields(struct net_device *dev,
+				struct ethtool_rxfh_fields *cmd)
 {
+	struct bnxt *bp = netdev_priv(dev);
+
 	cmd->data = 0;
 	switch (cmd->flow_type) {
 	case TCP_V4_FLOW:
@@ -1647,10 +1650,15 @@ static int bnxt_grxfh(struct bnxt *bp, struct ethtool_rxnfc *cmd)
 #define RXH_4TUPLE (RXH_IP_SRC | RXH_IP_DST | RXH_L4_B_0_1 | RXH_L4_B_2_3)
 #define RXH_2TUPLE (RXH_IP_SRC | RXH_IP_DST)
 
-static int bnxt_srxfh(struct bnxt *bp, struct ethtool_rxnfc *cmd)
+static int bnxt_set_rxfh_fields(struct net_device *dev,
+				const struct ethtool_rxfh_fields *cmd,
+				struct netlink_ext_ack *extack)
 {
-	u32 rss_hash_cfg = bp->rss_hash_cfg;
+	struct bnxt *bp = netdev_priv(dev);
 	int tuple, rc = 0;
+	u32 rss_hash_cfg;
+
+	rss_hash_cfg = bp->rss_hash_cfg;
 
 	if (cmd->data == RXH_4TUPLE)
 		tuple = 4;
@@ -1768,10 +1776,6 @@ static int bnxt_get_rxnfc(struct net_device *dev, struct ethtool_rxnfc *cmd,
 		rc = bnxt_grxclsrule(bp, cmd);
 		break;
 
-	case ETHTOOL_GRXFH:
-		rc = bnxt_grxfh(bp, cmd);
-		break;
-
 	default:
 		rc = -EOPNOTSUPP;
 		break;
@@ -1786,10 +1790,6 @@ static int bnxt_set_rxnfc(struct net_device *dev, struct ethtool_rxnfc *cmd)
 	int rc;
 
 	switch (cmd->cmd) {
-	case ETHTOOL_SRXFH:
-		rc = bnxt_srxfh(bp, cmd);
-		break;
-
 	case ETHTOOL_SRXCLSRLINS:
 		rc = bnxt_srxclsrlins(bp, cmd);
 		break;
@@ -2062,6 +2062,17 @@ static int bnxt_get_regs_len(struct net_device *dev)
 	return reg_len;
 }
 
+#define BNXT_PCIE_32B_ENTRY(start, end)			\
+	 { offsetof(struct pcie_ctx_hw_stats, start),	\
+	   offsetof(struct pcie_ctx_hw_stats, end) }
+
+static const struct {
+	u16 start;
+	u16 end;
+} bnxt_pcie_32b_entries[] = {
+	BNXT_PCIE_32B_ENTRY(pcie_ltssm_histogram[0], pcie_ltssm_histogram[3]),
+};
+
 static void bnxt_get_regs(struct net_device *dev, struct ethtool_regs *regs,
 			  void *_p)
 {
@@ -2094,12 +2105,27 @@ static void bnxt_get_regs(struct net_device *dev, struct ethtool_regs *regs,
 	req->pcie_stat_host_addr = cpu_to_le64(hw_pcie_stats_addr);
 	rc = hwrm_req_send(bp, req);
 	if (!rc) {
-		__le64 *src = (__le64 *)hw_pcie_stats;
-		u64 *dst = (u64 *)(_p + BNXT_PXP_REG_LEN);
-		int i;
+		u8 *dst = (u8 *)(_p + BNXT_PXP_REG_LEN);
+		u8 *src = (u8 *)hw_pcie_stats;
+		int i, j;
 
-		for (i = 0; i < sizeof(*hw_pcie_stats) / sizeof(__le64); i++)
-			dst[i] = le64_to_cpu(src[i]);
+		for (i = 0, j = 0; i < sizeof(*hw_pcie_stats); ) {
+			if (i >= bnxt_pcie_32b_entries[j].start &&
+			    i <= bnxt_pcie_32b_entries[j].end) {
+				u32 *dst32 = (u32 *)(dst + i);
+
+				*dst32 = le32_to_cpu(*(__le32 *)(src + i));
+				i += 4;
+				if (i > bnxt_pcie_32b_entries[j].end &&
+				    j < ARRAY_SIZE(bnxt_pcie_32b_entries) - 1)
+					j++;
+			} else {
+				u64 *dst64 = (u64 *)(dst + i);
+
+				*dst64 = le64_to_cpu(*(__le64 *)(src + i));
+				i += 8;
+			}
+		}
 	}
 	hwrm_req_drop(bp, req);
 }
@@ -4991,6 +5017,7 @@ static void bnxt_self_test(struct net_device *dev, struct ethtool_test *etest,
 	if (!bp->num_tests || !BNXT_PF(bp))
 		return;
 
+	memset(buf, 0, sizeof(u64) * bp->num_tests);
 	if (etest->flags & ETH_TEST_FL_OFFLINE &&
 	    bnxt_ulp_registered(bp->edev)) {
 		etest->flags |= ETH_TEST_FL_FAILED;
@@ -4998,7 +5025,6 @@ static void bnxt_self_test(struct net_device *dev, struct ethtool_test *etest,
 		return;
 	}
 
-	memset(buf, 0, sizeof(u64) * bp->num_tests);
 	if (!netif_running(dev)) {
 		etest->flags |= ETH_TEST_FL_FAILED;
 		return;
@@ -5495,6 +5521,8 @@ const struct ethtool_ops bnxt_ethtool_ops = {
 	.get_rxfh_key_size      = bnxt_get_rxfh_key_size,
 	.get_rxfh               = bnxt_get_rxfh,
 	.set_rxfh		= bnxt_set_rxfh,
+	.get_rxfh_fields        = bnxt_get_rxfh_fields,
+	.set_rxfh_fields        = bnxt_set_rxfh_fields,
 	.create_rxfh_context	= bnxt_create_rxfh_context,
 	.modify_rxfh_context	= bnxt_modify_rxfh_context,
 	.remove_rxfh_context	= bnxt_remove_rxfh_context,

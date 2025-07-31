@@ -91,14 +91,14 @@
  *   The partially empty slabs cached on the CPU partial list are used
  *   for performance reasons, which speeds up the allocation process.
  *   These slabs are not frozen, but are also exempt from list management,
- *   by clearing the PG_workingset flag when moving out of the node
+ *   by clearing the SL_partial flag when moving out of the node
  *   partial list. Please see __slab_free() for more details.
  *
  *   To sum up, the current scheme is:
- *   - node partial slab: PG_Workingset && !frozen
- *   - cpu partial slab: !PG_Workingset && !frozen
- *   - cpu slab: !PG_Workingset && frozen
- *   - full slab: !PG_Workingset && !frozen
+ *   - node partial slab: SL_partial && !frozen
+ *   - cpu partial slab: !SL_partial && !frozen
+ *   - cpu slab: !SL_partial && frozen
+ *   - full slab: !SL_partial && !frozen
  *
  *   list_lock
  *
@@ -182,6 +182,22 @@
  * 			options set. This moves	slab handling out of
  * 			the fast path and disables lockless freelists.
  */
+
+/**
+ * enum slab_flags - How the slab flags bits are used.
+ * @SL_locked: Is locked with slab_lock()
+ * @SL_partial: On the per-node partial list
+ * @SL_pfmemalloc: Was allocated from PF_MEMALLOC reserves
+ *
+ * The slab flags share space with the page flags but some bits have
+ * different interpretations.  The high bits are used for information
+ * like zone/node/section.
+ */
+enum slab_flags {
+	SL_locked = PG_locked,
+	SL_partial = PG_workingset,	/* Historical reasons for this bit */
+	SL_pfmemalloc = PG_active,	/* Historical reasons for this bit */
+};
 
 /*
  * We could simply use migrate_disable()/enable() but as long as it's a
@@ -635,16 +651,35 @@ static inline unsigned int slub_get_cpu_partial(struct kmem_cache *s)
 #endif /* CONFIG_SLUB_CPU_PARTIAL */
 
 /*
+ * If network-based swap is enabled, slub must keep track of whether memory
+ * were allocated from pfmemalloc reserves.
+ */
+static inline bool slab_test_pfmemalloc(const struct slab *slab)
+{
+	return test_bit(SL_pfmemalloc, &slab->flags);
+}
+
+static inline void slab_set_pfmemalloc(struct slab *slab)
+{
+	set_bit(SL_pfmemalloc, &slab->flags);
+}
+
+static inline void __slab_clear_pfmemalloc(struct slab *slab)
+{
+	__clear_bit(SL_pfmemalloc, &slab->flags);
+}
+
+/*
  * Per slab locking using the pagelock
  */
 static __always_inline void slab_lock(struct slab *slab)
 {
-	bit_spin_lock(PG_locked, &slab->__page_flags);
+	bit_spin_lock(SL_locked, &slab->flags);
 }
 
 static __always_inline void slab_unlock(struct slab *slab)
 {
-	bit_spin_unlock(PG_locked, &slab->__page_flags);
+	bit_spin_unlock(SL_locked, &slab->flags);
 }
 
 static inline bool
@@ -1010,7 +1045,7 @@ static void print_slab_info(const struct slab *slab)
 {
 	pr_err("Slab 0x%p objects=%u used=%u fp=0x%p flags=%pGp\n",
 	       slab, slab->objects, slab->inuse, slab->freelist,
-	       &slab->__page_flags);
+	       &slab->flags);
 }
 
 void skip_orig_size_check(struct kmem_cache *s, const void *object)
@@ -1973,6 +2008,11 @@ static inline void handle_failed_objexts_alloc(unsigned long obj_exts,
 #define OBJCGS_CLEAR_MASK	(__GFP_DMA | __GFP_RECLAIMABLE | \
 				__GFP_ACCOUNT | __GFP_NOFAIL)
 
+static inline void init_slab_obj_exts(struct slab *slab)
+{
+	slab->obj_exts = 0;
+}
+
 int alloc_slab_obj_exts(struct slab *slab, struct kmem_cache *s,
 		        gfp_t gfp, bool new_slab)
 {
@@ -2043,19 +2083,11 @@ static inline void free_slab_obj_exts(struct slab *slab)
 	slab->obj_exts = 0;
 }
 
-static inline bool need_slab_obj_ext(void)
-{
-	if (mem_alloc_profiling_enabled())
-		return true;
-
-	/*
-	 * CONFIG_MEMCG creates vector of obj_cgroup objects conditionally
-	 * inside memcg_slab_post_alloc_hook. No other users for now.
-	 */
-	return false;
-}
-
 #else /* CONFIG_SLAB_OBJ_EXT */
+
+static inline void init_slab_obj_exts(struct slab *slab)
+{
+}
 
 static int alloc_slab_obj_exts(struct slab *slab, struct kmem_cache *s,
 			       gfp_t gfp, bool new_slab)
@@ -2065,11 +2097,6 @@ static int alloc_slab_obj_exts(struct slab *slab, struct kmem_cache *s,
 
 static inline void free_slab_obj_exts(struct slab *slab)
 {
-}
-
-static inline bool need_slab_obj_ext(void)
-{
-	return false;
 }
 
 #endif /* CONFIG_SLAB_OBJ_EXT */
@@ -2092,40 +2119,45 @@ prepare_slab_obj_exts_hook(struct kmem_cache *s, gfp_t flags, void *p)
 
 	slab = virt_to_slab(p);
 	if (!slab_obj_exts(slab) &&
-	    WARN(alloc_slab_obj_exts(slab, s, flags, false),
-		 "%s, %s: Failed to create slab extension vector!\n",
-		 __func__, s->name))
+	    alloc_slab_obj_exts(slab, s, flags, false)) {
+		pr_warn_once("%s, %s: Failed to create slab extension vector!\n",
+			     __func__, s->name);
 		return NULL;
+	}
 
 	return slab_obj_exts(slab) + obj_to_index(s, slab, p);
+}
+
+/* Should be called only if mem_alloc_profiling_enabled() */
+static noinline void
+__alloc_tagging_slab_alloc_hook(struct kmem_cache *s, void *object, gfp_t flags)
+{
+	struct slabobj_ext *obj_exts;
+
+	obj_exts = prepare_slab_obj_exts_hook(s, flags, object);
+	/*
+	 * Currently obj_exts is used only for allocation profiling.
+	 * If other users appear then mem_alloc_profiling_enabled()
+	 * check should be added before alloc_tag_add().
+	 */
+	if (likely(obj_exts))
+		alloc_tag_add(&obj_exts->ref, current->alloc_tag, s->size);
 }
 
 static inline void
 alloc_tagging_slab_alloc_hook(struct kmem_cache *s, void *object, gfp_t flags)
 {
-	if (need_slab_obj_ext()) {
-		struct slabobj_ext *obj_exts;
-
-		obj_exts = prepare_slab_obj_exts_hook(s, flags, object);
-		/*
-		 * Currently obj_exts is used only for allocation profiling.
-		 * If other users appear then mem_alloc_profiling_enabled()
-		 * check should be added before alloc_tag_add().
-		 */
-		if (likely(obj_exts))
-			alloc_tag_add(&obj_exts->ref, current->alloc_tag, s->size);
-	}
+	if (mem_alloc_profiling_enabled())
+		__alloc_tagging_slab_alloc_hook(s, object, flags);
 }
 
-static inline void
-alloc_tagging_slab_free_hook(struct kmem_cache *s, struct slab *slab, void **p,
-			     int objects)
+/* Should be called only if mem_alloc_profiling_enabled() */
+static noinline void
+__alloc_tagging_slab_free_hook(struct kmem_cache *s, struct slab *slab, void **p,
+			       int objects)
 {
 	struct slabobj_ext *obj_exts;
 	int i;
-
-	if (!mem_alloc_profiling_enabled())
-		return;
 
 	/* slab->obj_exts might not be NULL if it was created for MEMCG accounting. */
 	if (s->flags & (SLAB_NO_OBJ_EXT | SLAB_NOLEAKTRACE))
@@ -2140,6 +2172,14 @@ alloc_tagging_slab_free_hook(struct kmem_cache *s, struct slab *slab, void **p,
 
 		alloc_tag_sub(&obj_exts[off].ref, s->size);
 	}
+}
+
+static inline void
+alloc_tagging_slab_free_hook(struct kmem_cache *s, struct slab *slab, void **p,
+			     int objects)
+{
+	if (mem_alloc_profiling_enabled())
+		__alloc_tagging_slab_free_hook(s, slab, p, objects);
 }
 
 #else /* CONFIG_MEM_ALLOC_PROFILING */
@@ -2579,8 +2619,12 @@ static __always_inline void account_slab(struct slab *slab, int order,
 static __always_inline void unaccount_slab(struct slab *slab, int order,
 					   struct kmem_cache *s)
 {
-	if (memcg_kmem_online() || need_slab_obj_ext())
-		free_slab_obj_exts(slab);
+	/*
+	 * The slab object extensions should now be freed regardless of
+	 * whether mem_alloc_profiling_enabled() or not because profiling
+	 * might have been disabled after slab->obj_exts got allocated.
+	 */
+	free_slab_obj_exts(slab);
 
 	mod_node_page_state(slab_pgdat(slab), cache_vmstat_idx(s),
 			    -(PAGE_SIZE << order));
@@ -2624,6 +2668,7 @@ static struct slab *allocate_slab(struct kmem_cache *s, gfp_t flags, int node)
 	slab->objects = oo_objects(oo);
 	slab->inuse = 0;
 	slab->frozen = 0;
+	init_slab_obj_exts(slab);
 
 	account_slab(slab, oo_order(oo), s, flags);
 
@@ -2707,23 +2752,19 @@ static void discard_slab(struct kmem_cache *s, struct slab *slab)
 	free_slab(s, slab);
 }
 
-/*
- * SLUB reuses PG_workingset bit to keep track of whether it's on
- * the per-node partial list.
- */
 static inline bool slab_test_node_partial(const struct slab *slab)
 {
-	return folio_test_workingset(slab_folio(slab));
+	return test_bit(SL_partial, &slab->flags);
 }
 
 static inline void slab_set_node_partial(struct slab *slab)
 {
-	set_bit(PG_workingset, folio_flags(slab_folio(slab), 0));
+	set_bit(SL_partial, &slab->flags);
 }
 
 static inline void slab_clear_node_partial(struct slab *slab)
 {
-	clear_bit(PG_workingset, folio_flags(slab_folio(slab), 0));
+	clear_bit(SL_partial, &slab->flags);
 }
 
 /*
@@ -4259,7 +4300,12 @@ static void *___kmalloc_large_node(size_t size, gfp_t flags, int node)
 		flags = kmalloc_fix_flags(flags);
 
 	flags |= __GFP_COMP;
-	folio = (struct folio *)alloc_pages_node_noprof(node, flags, order);
+
+	if (node == NUMA_NO_NODE)
+		folio = (struct folio *)alloc_frozen_pages_noprof(flags, order);
+	else
+		folio = (struct folio *)__alloc_frozen_pages_noprof(flags, order, node, NULL);
+
 	if (folio) {
 		ptr = folio_address(folio);
 		lruvec_stat_mod_folio(folio, NR_SLAB_UNRECLAIMABLE_B,
@@ -4755,7 +4801,7 @@ static void free_large_kmalloc(struct folio *folio, void *object)
 	lruvec_stat_mod_folio(folio, NR_SLAB_UNRECLAIMABLE_B,
 			      -(PAGE_SIZE << order));
 	__folio_clear_large_kmalloc(folio);
-	folio_put(folio);
+	free_frozen_pages(&folio->page, order);
 }
 
 /*
@@ -4920,12 +4966,12 @@ alloc_new:
  * When slub_debug_orig_size() is off, krealloc() only knows about the bucket
  * size of an allocation (but not the exact size it was allocated with) and
  * hence implements the following semantics for shrinking and growing buffers
- * with __GFP_ZERO.
+ * with __GFP_ZERO::
  *
- *         new             bucket
- * 0       size             size
- * |--------|----------------|
- * |  keep  |      zero      |
+ *           new             bucket
+ *   0       size             size
+ *   |--------|----------------|
+ *   |  keep  |      zero      |
  *
  * Otherwise, the original allocation size 'orig_size' could be used to
  * precisely clear the requested size, and the new size will also be stored
@@ -4959,14 +5005,16 @@ static gfp_t kmalloc_gfp_adjust(gfp_t flags, size_t size)
 	 * We want to attempt a large physically contiguous block first because
 	 * it is less likely to fragment multiple larger blocks and therefore
 	 * contribute to a long term fragmentation less than vmalloc fallback.
-	 * However make sure that larger requests are not too disruptive - no
-	 * OOM killer and no allocation failure warnings as we have a fallback.
+	 * However make sure that larger requests are not too disruptive - i.e.
+	 * do not direct reclaim unless physically continuous memory is preferred
+	 * (__GFP_RETRY_MAYFAIL mode). We still kick in kswapd/kcompactd to
+	 * start working in the background
 	 */
 	if (size > PAGE_SIZE) {
 		flags |= __GFP_NOWARN;
 
 		if (!(flags & __GFP_RETRY_MAYFAIL))
-			flags |= __GFP_NORETRY;
+			flags &= ~__GFP_DIRECT_RECLAIM;
 
 		/* nofail semantic is implemented by the vmalloc fallback */
 		flags &= ~__GFP_NOFAIL;

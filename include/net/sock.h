@@ -337,8 +337,16 @@ struct sk_filter;
   *	@sk_txtime_deadline_mode: set deadline mode for SO_TXTIME
   *	@sk_txtime_report_errors: set report errors mode for SO_TXTIME
   *	@sk_txtime_unused: unused txtime flags
+  *	@sk_scm_recv_flags: all flags used by scm_recv()
+  *	@sk_scm_credentials: flagged by SO_PASSCRED to recv SCM_CREDENTIALS
+  *	@sk_scm_security: flagged by SO_PASSSEC to recv SCM_SECURITY
+  *	@sk_scm_pidfd: flagged by SO_PASSPIDFD to recv SCM_PIDFD
+  *	@sk_scm_rights: flagged by SO_PASSRIGHTS to recv SCM_RIGHTS
+  *	@sk_scm_unused: unused flags for scm_recv()
   *	@ns_tracker: tracker for netns reference
   *	@sk_user_frags: xarray of pages the user is holding a reference on.
+  *	@sk_owner: reference to the real owner of the socket that calls
+  *		   sock_lock_init_class_and_name().
   */
 struct sock {
 	/*
@@ -521,7 +529,17 @@ struct sock {
 #endif
 	int			sk_disconnects;
 
-	u8			sk_txrehash;
+	union {
+		u8		sk_txrehash;
+		u8		sk_scm_recv_flags;
+		struct {
+			u8	sk_scm_credentials : 1,
+				sk_scm_security : 1,
+				sk_scm_pidfd : 1,
+				sk_scm_rights : 1,
+				sk_scm_unused : 4;
+		};
+	};
 	u8			sk_clockid;
 	u8			sk_txtime_deadline_mode : 1,
 				sk_txtime_report_errors : 1,
@@ -547,6 +565,10 @@ struct sock {
 	struct rcu_head		sk_rcu;
 	netns_tracker		ns_tracker;
 	struct xarray		sk_user_frags;
+
+#if IS_ENABLED(CONFIG_PROVE_LOCKING) && IS_ENABLED(CONFIG_MODULES)
+	struct module		*sk_owner;
+#endif
 };
 
 struct sock_bh_locked {
@@ -1531,7 +1553,7 @@ __sk_rmem_schedule(struct sock *sk, int size, bool pfmemalloc)
 }
 
 static inline bool
-sk_rmem_schedule(struct sock *sk, struct sk_buff *skb, int size)
+sk_rmem_schedule(struct sock *sk, const struct sk_buff *skb, int size)
 {
 	return __sk_rmem_schedule(sk, size, skb_pfmemalloc(skb));
 }
@@ -1583,6 +1605,35 @@ static inline void sk_mem_uncharge(struct sock *sk, int size)
 	sk_mem_reclaim(sk);
 }
 
+#if IS_ENABLED(CONFIG_PROVE_LOCKING) && IS_ENABLED(CONFIG_MODULES)
+static inline void sk_owner_set(struct sock *sk, struct module *owner)
+{
+	__module_get(owner);
+	sk->sk_owner = owner;
+}
+
+static inline void sk_owner_clear(struct sock *sk)
+{
+	sk->sk_owner = NULL;
+}
+
+static inline void sk_owner_put(struct sock *sk)
+{
+	module_put(sk->sk_owner);
+}
+#else
+static inline void sk_owner_set(struct sock *sk, struct module *owner)
+{
+}
+
+static inline void sk_owner_clear(struct sock *sk)
+{
+}
+
+static inline void sk_owner_put(struct sock *sk)
+{
+}
+#endif
 /*
  * Macro so as to not evaluate some arguments when
  * lockdep is not enabled.
@@ -1592,13 +1643,14 @@ static inline void sk_mem_uncharge(struct sock *sk, int size)
  */
 #define sock_lock_init_class_and_name(sk, sname, skey, name, key)	\
 do {									\
+	sk_owner_set(sk, THIS_MODULE);					\
 	sk->sk_lock.owned = 0;						\
 	init_waitqueue_head(&sk->sk_lock.wq);				\
 	spin_lock_init(&(sk)->sk_lock.slock);				\
 	debug_check_no_locks_freed((void *)&(sk)->sk_lock,		\
-			sizeof((sk)->sk_lock));				\
+				   sizeof((sk)->sk_lock));		\
 	lockdep_set_class_and_name(&(sk)->sk_lock.slock,		\
-				(skey), (sname));				\
+				   (skey), (sname));			\
 	lockdep_init_map(&(sk)->sk_lock.dep_map, (name), (key), 0);	\
 } while (0)
 
@@ -1745,7 +1797,6 @@ void sk_free(struct sock *sk);
 void sk_net_refcnt_upgrade(struct sock *sk);
 void sk_destruct(struct sock *sk);
 struct sock *sk_clone_lock(const struct sock *sk, const gfp_t priority);
-void sk_free_unlock_clone(struct sock *sk);
 
 struct sk_buff *sock_wmalloc(struct sock *sk, unsigned long size, int force,
 			     gfp_t priority);
@@ -1816,6 +1867,7 @@ struct sockcm_cookie {
 	u32 tsflags;
 	u32 ts_opt_id;
 	u32 priority;
+	u32 dmabuf_id;
 };
 
 static inline void sockcm_init(struct sockcm_cookie *sockc,
@@ -2024,6 +2076,7 @@ static inline void sock_orphan(struct sock *sk)
 	sock_set_flag(sk, SOCK_DEAD);
 	sk_set_socket(sk, NULL);
 	sk->sk_wq  = NULL;
+	/* Note: sk_uid is unchanged. */
 	write_unlock_bh(&sk->sk_callback_lock);
 }
 
@@ -2034,18 +2087,23 @@ static inline void sock_graft(struct sock *sk, struct socket *parent)
 	rcu_assign_pointer(sk->sk_wq, &parent->wq);
 	parent->sk = sk;
 	sk_set_socket(sk, parent);
-	sk->sk_uid = SOCK_INODE(parent)->i_uid;
+	WRITE_ONCE(sk->sk_uid, SOCK_INODE(parent)->i_uid);
 	security_sock_graft(sk, parent);
 	write_unlock_bh(&sk->sk_callback_lock);
 }
 
-kuid_t sock_i_uid(struct sock *sk);
+static inline kuid_t sk_uid(const struct sock *sk)
+{
+	/* Paired with WRITE_ONCE() in sockfs_setattr() */
+	return READ_ONCE(sk->sk_uid);
+}
+
 unsigned long __sock_i_ino(struct sock *sk);
 unsigned long sock_i_ino(struct sock *sk);
 
 static inline kuid_t sock_net_uid(const struct net *net, const struct sock *sk)
 {
-	return sk ? sk->sk_uid : make_kuid(net->user_ns, 0);
+	return sk ? sk_uid(sk) : make_kuid(net->user_ns, 0);
 }
 
 static inline u32 net_tx_rndhash(void)
@@ -2538,12 +2596,12 @@ static inline gfp_t gfp_memcg_charge(void)
 
 static inline long sock_rcvtimeo(const struct sock *sk, bool noblock)
 {
-	return noblock ? 0 : sk->sk_rcvtimeo;
+	return noblock ? 0 : READ_ONCE(sk->sk_rcvtimeo);
 }
 
 static inline long sock_sndtimeo(const struct sock *sk, bool noblock)
 {
-	return noblock ? 0 : sk->sk_sndtimeo;
+	return noblock ? 0 : READ_ONCE(sk->sk_sndtimeo);
 }
 
 static inline int sock_rcvlowat(const struct sock *sk, int waitall, int len)
@@ -2569,8 +2627,8 @@ struct sock_skb_cb {
  * using skb->cb[] would keep using it directly and utilize its
  * alignment guarantee.
  */
-#define SOCK_SKB_CB_OFFSET ((sizeof_field(struct sk_buff, cb) - \
-			    sizeof(struct sock_skb_cb)))
+#define SOCK_SKB_CB_OFFSET (sizeof_field(struct sk_buff, cb) - \
+			    sizeof(struct sock_skb_cb))
 
 #define SOCK_SKB_CB(__skb) ((struct sock_skb_cb *)((__skb)->cb + \
 			    SOCK_SKB_CB_OFFSET))
@@ -2624,6 +2682,10 @@ void __sock_recv_timestamp(struct msghdr *msg, struct sock *sk,
 			   struct sk_buff *skb);
 void __sock_recv_wifi_status(struct msghdr *msg, struct sock *sk,
 			     struct sk_buff *skb);
+
+bool skb_has_tx_timestamp(struct sk_buff *skb, const struct sock *sk);
+int skb_get_tx_timestamp(struct sk_buff *skb, struct sock *sk,
+			 struct timespec64 *ts);
 
 static inline void
 sock_recv_timestamp(struct msghdr *msg, struct sock *sk, struct sk_buff *skb)
@@ -2700,8 +2762,6 @@ static inline void _sock_tx_timestamp(struct sock *sk,
 				*tskey = atomic_inc_return(&sk->sk_tskey) - 1;
 		}
 	}
-	if (unlikely(sock_flag(sk, SOCK_WIFI_STATUS)))
-		*tx_flags |= SKBTX_WIFI_STATUS;
 }
 
 static inline void sock_tx_timestamp(struct sock *sk,
@@ -2739,14 +2799,26 @@ static inline bool sk_is_udp(const struct sock *sk)
 	       sk->sk_protocol == IPPROTO_UDP;
 }
 
+static inline bool sk_is_unix(const struct sock *sk)
+{
+	return sk->sk_family == AF_UNIX;
+}
+
 static inline bool sk_is_stream_unix(const struct sock *sk)
 {
-	return sk->sk_family == AF_UNIX && sk->sk_type == SOCK_STREAM;
+	return sk_is_unix(sk) && sk->sk_type == SOCK_STREAM;
 }
 
 static inline bool sk_is_vsock(const struct sock *sk)
 {
 	return sk->sk_family == AF_VSOCK;
+}
+
+static inline bool sk_may_scm_recv(const struct sock *sk)
+{
+	return (IS_ENABLED(CONFIG_UNIX) && sk->sk_family == AF_UNIX) ||
+		sk->sk_family == AF_NETLINK ||
+		(IS_ENABLED(CONFIG_BT) && sk->sk_family == AF_BLUETOOTH);
 }
 
 /**
@@ -2786,6 +2858,12 @@ sk_is_refcounted(struct sock *sk)
 {
 	/* Only full sockets have sk->sk_flags. */
 	return !sk_fullsock(sk) || !sock_flag(sk, SOCK_RCU_FREE);
+}
+
+static inline bool
+sk_requests_wifi_status(struct sock *sk)
+{
+	return sk && sk_fullsock(sk) && sock_flag(sk, SOCK_WIFI_STATUS);
 }
 
 /* Checks if this SKB belongs to an HW offloaded socket
@@ -2914,7 +2992,6 @@ void sock_set_timestamp(struct sock *sk, int optname, bool valbool);
 int sock_set_timestamping(struct sock *sk, int optname,
 			  struct so_timestamping timestamping);
 
-void sock_enable_timestamps(struct sock *sk);
 #if defined(CONFIG_CGROUP_BPF)
 void bpf_skops_tx_timestamping(struct sock *sk, struct sk_buff *skb, int op);
 #else
@@ -2942,8 +3019,11 @@ int sock_ioctl_inout(struct sock *sk, unsigned int cmd,
 int sk_ioctl(struct sock *sk, unsigned int cmd, void __user *arg);
 static inline bool sk_is_readable(struct sock *sk)
 {
-	if (sk->sk_prot->sock_is_readable)
-		return sk->sk_prot->sock_is_readable(sk);
+	const struct proto *prot = READ_ONCE(sk->sk_prot);
+
+	if (prot->sock_is_readable)
+		return prot->sock_is_readable(sk);
+
 	return false;
 }
 #endif	/* _SOCK_H */

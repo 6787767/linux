@@ -200,11 +200,11 @@ static int __power_supply_populate_supplied_from(struct power_supply *epsy,
 	int i = 0;
 
 	do {
-		np = of_parse_phandle(psy->of_node, "power-supplies", i++);
+		np = of_parse_phandle(psy->dev.of_node, "power-supplies", i++);
 		if (!np)
 			break;
 
-		if (np == epsy->of_node) {
+		if (np == epsy->dev.of_node) {
 			dev_dbg(&psy->dev, "%s: Found supply : %s\n",
 				psy->desc->name, epsy->desc->name);
 			psy->supplied_from[i-1] = (char *)epsy->desc->name;
@@ -235,7 +235,7 @@ static int  __power_supply_find_supply_from_node(struct power_supply *epsy,
 	struct device_node *np = data;
 
 	/* returning non-zero breaks out of power_supply_for_each_psy loop */
-	if (epsy->of_node == np)
+	if (epsy->dev.of_node == np)
 		return 1;
 
 	return 0;
@@ -270,13 +270,13 @@ static int power_supply_check_supplies(struct power_supply *psy)
 		return 0;
 
 	/* No device node found, nothing to do */
-	if (!psy->of_node)
+	if (!psy->dev.of_node)
 		return 0;
 
 	do {
 		int ret;
 
-		np = of_parse_phandle(psy->of_node, "power-supplies", cnt++);
+		np = of_parse_phandle(psy->dev.of_node, "power-supplies", cnt++);
 		if (!np)
 			break;
 
@@ -449,19 +449,6 @@ int power_supply_get_property_from_supplier(struct power_supply *psy,
 }
 EXPORT_SYMBOL_GPL(power_supply_get_property_from_supplier);
 
-int power_supply_set_battery_charged(struct power_supply *psy)
-{
-	if (atomic_read(&psy->use_cnt) >= 0 &&
-			psy->desc->type == POWER_SUPPLY_TYPE_BATTERY &&
-			psy->desc->set_charged) {
-		psy->desc->set_charged(psy);
-		return 0;
-	}
-
-	return -EINVAL;
-}
-EXPORT_SYMBOL_GPL(power_supply_set_battery_charged);
-
 static int power_supply_match_device_by_name(struct device *dev, const void *data)
 {
 	const char *name = data;
@@ -606,8 +593,8 @@ int power_supply_get_battery_info(struct power_supply *psy,
 	const __be32 *list;
 	u32 min_max[2];
 
-	if (psy->of_node) {
-		battery_np = of_parse_phandle(psy->of_node, "monitored-battery", 0);
+	if (psy->dev.of_node) {
+		battery_np = of_parse_phandle(psy->dev.of_node, "monitored-battery", 0);
 		if (!battery_np)
 			return -ENODEV;
 
@@ -1248,9 +1235,8 @@ bool power_supply_has_property(struct power_supply *psy,
 	return false;
 }
 
-int power_supply_get_property(struct power_supply *psy,
-			    enum power_supply_property psp,
-			    union power_supply_propval *val)
+static int __power_supply_get_property(struct power_supply *psy, enum power_supply_property psp,
+				       union power_supply_propval *val, bool use_extensions)
 {
 	struct power_supply_ext_registration *reg;
 
@@ -1260,10 +1246,14 @@ int power_supply_get_property(struct power_supply *psy,
 		return -ENODEV;
 	}
 
-	scoped_guard(rwsem_read, &psy->extensions_sem) {
-		power_supply_for_each_extension(reg, psy) {
-			if (power_supply_ext_has_property(reg->ext, psp))
+	if (use_extensions) {
+		scoped_guard(rwsem_read, &psy->extensions_sem) {
+			power_supply_for_each_extension(reg, psy) {
+				if (!power_supply_ext_has_property(reg->ext, psp))
+					continue;
+
 				return reg->ext->get_property(psy, reg->ext, reg->data, psp, val);
+			}
 		}
 	}
 
@@ -1274,20 +1264,49 @@ int power_supply_get_property(struct power_supply *psy,
 	else
 		return -EINVAL;
 }
+
+int power_supply_get_property(struct power_supply *psy, enum power_supply_property psp,
+			      union power_supply_propval *val)
+{
+	return __power_supply_get_property(psy, psp, val, true);
+}
 EXPORT_SYMBOL_GPL(power_supply_get_property);
 
-int power_supply_set_property(struct power_supply *psy,
-			    enum power_supply_property psp,
-			    const union power_supply_propval *val)
+/**
+ * power_supply_get_property_direct - Read a power supply property without checking for extensions
+ * @psy: The power supply
+ * @psp: The power supply property to read
+ * @val: The resulting value of the power supply property
+ *
+ * Read a power supply property without taking into account any power supply extensions registered
+ * on the given power supply. This is mostly useful for power supply extensions that want to access
+ * their own power supply as using power_supply_get_property() directly will result in a potential
+ * deadlock.
+ *
+ * Return: 0 on success or negative error code on failure.
+ */
+int power_supply_get_property_direct(struct power_supply *psy, enum power_supply_property psp,
+				     union power_supply_propval *val)
+{
+        return __power_supply_get_property(psy, psp, val, false);
+}
+EXPORT_SYMBOL_GPL(power_supply_get_property_direct);
+
+
+static int __power_supply_set_property(struct power_supply *psy, enum power_supply_property psp,
+				       const union power_supply_propval *val, bool use_extensions)
 {
 	struct power_supply_ext_registration *reg;
 
 	if (atomic_read(&psy->use_cnt) <= 0)
 		return -ENODEV;
 
-	scoped_guard(rwsem_read, &psy->extensions_sem) {
-		power_supply_for_each_extension(reg, psy) {
-			if (power_supply_ext_has_property(reg->ext, psp)) {
+	if (use_extensions) {
+		scoped_guard(rwsem_read, &psy->extensions_sem) {
+			power_supply_for_each_extension(reg, psy) {
+				if (!power_supply_ext_has_property(reg->ext, psp))
+					continue;
+
 				if (reg->ext->set_property)
 					return reg->ext->set_property(psy, reg->ext, reg->data,
 								      psp, val);
@@ -1302,7 +1321,33 @@ int power_supply_set_property(struct power_supply *psy,
 
 	return psy->desc->set_property(psy, psp, val);
 }
+
+int power_supply_set_property(struct power_supply *psy, enum power_supply_property psp,
+			      const union power_supply_propval *val)
+{
+	return __power_supply_set_property(psy, psp, val, true);
+}
 EXPORT_SYMBOL_GPL(power_supply_set_property);
+
+/**
+ * power_supply_set_property_direct - Write a power supply property without checking for extensions
+ * @psy: The power supply
+ * @psp: The power supply property to write
+ * @val: The value to write to the power supply property
+ *
+ * Write a power supply property without taking into account any power supply extensions registered
+ * on the given power supply. This is mostly useful for power supply extensions that want to access
+ * their own power supply as using power_supply_set_property() directly will result in a potential
+ * deadlock.
+ *
+ * Return: 0 on success or negative error code on failure.
+ */
+int power_supply_set_property_direct(struct power_supply *psy, enum power_supply_property psp,
+				     const union power_supply_propval *val)
+{
+	return __power_supply_set_property(psy, psp, val, false);
+}
+EXPORT_SYMBOL_GPL(power_supply_set_property_direct);
 
 int power_supply_property_is_writeable(struct power_supply *psy,
 					enum power_supply_property psp)
@@ -1544,9 +1589,8 @@ __power_supply_register(struct device *parent,
 	if (cfg) {
 		dev->groups = cfg->attr_grp;
 		psy->drv_data = cfg->drv_data;
-		psy->of_node =
+		dev->of_node =
 			cfg->fwnode ? to_of_node(cfg->fwnode) : cfg->of_node;
-		dev->of_node = psy->of_node;
 		psy->supplied_to = cfg->supplied_to;
 		psy->num_supplicants = cfg->num_supplicants;
 	}

@@ -372,6 +372,7 @@ static int acp_power_on(struct acp_chip_info *chip)
 		break;
 	case ACP70_PCI_ID:
 	case ACP71_PCI_ID:
+	case ACP72_PCI_ID:
 		acp_pgfsm_stat_reg = ACP70_PGFSM_STATUS;
 		acp_pgfsm_ctrl_reg = ACP70_PGFSM_CONTROL;
 		break;
@@ -450,7 +451,7 @@ int acp_machine_select(struct acp_chip_info *chip)
 	struct snd_soc_acpi_mach *mach;
 	int size, platform;
 
-	if (chip->flag == FLAG_AMD_LEGACY_ONLY_DMIC) {
+	if (chip->flag == FLAG_AMD_LEGACY_ONLY_DMIC && chip->is_pdm_dev) {
 		platform = chip->acp_rev;
 		chip->mach_dev = platform_device_register_data(chip->dev, "acp-pdm-mach",
 							       PLATFORM_DEVID_NONE, &platform,
@@ -573,6 +574,7 @@ void check_acp_config(struct pci_dev *pci, struct acp_chip_info *chip)
 		break;
 	case ACP70_PCI_ID:
 	case ACP71_PCI_ID:
+	case ACP72_PCI_ID:
 		pdm_addr = ACP70_PDM_ADDR;
 		check_acp70_config(chip);
 		break;

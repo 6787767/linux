@@ -7396,13 +7396,15 @@ static int scarlett2_mux_src_enum_ctl_info(struct snd_kcontrol *kctl,
 
 			if (port_type == SCARLETT2_PORT_TYPE_MIX &&
 			    item >= private->num_mix_out)
-				sprintf(uinfo->value.enumerated.name,
-					port->dsp_src_descr,
-					item - private->num_mix_out + 1);
+				scnprintf(uinfo->value.enumerated.name,
+					  sizeof(uinfo->value.enumerated.name),
+					  port->dsp_src_descr,
+					  item - private->num_mix_out + 1);
 			else
-				sprintf(uinfo->value.enumerated.name,
-					port->src_descr,
-					item + port->src_num_offset);
+				scnprintf(uinfo->value.enumerated.name,
+					  sizeof(uinfo->value.enumerated.name),
+					  port->src_descr,
+					  item + port->src_num_offset);
 
 			return 0;
 		}
@@ -8574,8 +8576,7 @@ static int scarlett2_find_fc_interface(struct usb_device *dev,
 
 		epd = get_endpoint(intf->altsetting, 0);
 		private->bInterfaceNumber = desc->bInterfaceNumber;
-		private->bEndpointAddress = epd->bEndpointAddress &
-			USB_ENDPOINT_NUMBER_MASK;
+		private->bEndpointAddress = usb_endpoint_num(epd);
 		private->wMaxPacketSize = le16_to_cpu(epd->wMaxPacketSize);
 		private->bInterval = epd->bInterval;
 		return 0;

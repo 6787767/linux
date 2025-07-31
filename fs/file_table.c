@@ -52,16 +52,19 @@ struct backing_file {
 	};
 };
 
-static inline struct backing_file *backing_file(struct file *f)
-{
-	return container_of(f, struct backing_file, file);
-}
+#define backing_file(f) container_of(f, struct backing_file, file)
 
-struct path *backing_file_user_path(struct file *f)
+struct path *backing_file_user_path(const struct file *f)
 {
 	return &backing_file(f)->user_path;
 }
 EXPORT_SYMBOL_GPL(backing_file_user_path);
+
+void backing_file_set_user_path(struct file *f, const struct path *path)
+{
+	backing_file(f)->user_path = *path;
+}
+EXPORT_SYMBOL_GPL(backing_file_set_user_path);
 
 static inline void file_free(struct file *f)
 {
@@ -102,7 +105,7 @@ EXPORT_SYMBOL_GPL(get_max_files);
 static int proc_nr_files(const struct ctl_table *table, int write, void *buffer,
 			 size_t *lenp, loff_t *ppos)
 {
-	files_stat.nr_files = get_nr_files();
+	files_stat.nr_files = percpu_counter_sum_positive(&nr_files);
 	return proc_doulongvec_minmax(table, write, buffer, lenp, ppos);
 }
 

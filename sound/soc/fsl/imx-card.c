@@ -513,7 +513,6 @@ static int imx_card_parse_of(struct imx_card_data *data)
 	struct device_node *platform = NULL;
 	struct device_node *codec = NULL;
 	struct device_node *cpu = NULL;
-	struct device_node *np;
 	struct device *dev = card->dev;
 	struct snd_soc_dai_link *link;
 	struct dai_link_data *link_data;
@@ -544,7 +543,7 @@ static int imx_card_parse_of(struct imx_card_data *data)
 	if (!card->dai_link)
 		return -ENOMEM;
 
-	data->link_data = devm_kcalloc(dev, num_links, sizeof(*link), GFP_KERNEL);
+	data->link_data = devm_kcalloc(dev, num_links, sizeof(*link_data), GFP_KERNEL);
 	if (!data->link_data)
 		return -ENOMEM;
 
@@ -552,11 +551,10 @@ static int imx_card_parse_of(struct imx_card_data *data)
 	link = card->dai_link;
 	link_data = data->link_data;
 
-	for_each_child_of_node(dev->of_node, np) {
+	for_each_child_of_node_scoped(dev->of_node, np) {
 		dlc = devm_kzalloc(dev, 2 * sizeof(*dlc), GFP_KERNEL);
 		if (!dlc) {
-			ret = -ENOMEM;
-			goto err_put_np;
+			return -ENOMEM;
 		}
 
 		link->cpus	= &dlc[0];
@@ -567,8 +565,8 @@ static int imx_card_parse_of(struct imx_card_data *data)
 
 		ret = of_property_read_string(np, "link-name", &link->name);
 		if (ret) {
-			dev_err(card->dev, "error getting codec dai_link name\n");
-			goto err_put_np;
+			return dev_err_probe(card->dev, ret,
+					     "error getting codec dai_link name\n");
 		}
 
 		cpu = of_get_child_by_name(np, "cpu");
@@ -670,9 +668,12 @@ static int imx_card_parse_of(struct imx_card_data *data)
 			}
 		} else if (!strncmp(link->name, "HiFi-ASRC-BE", 12)) {
 			/* DPCM backend */
+			/*
+			 * No need to have link->platforms. alloced dlc[1] will be just wasted,
+			 * but it won't leak.
+			 */
 			link->no_pcm = 1;
-			link->platforms->of_node = NULL;
-			link->platforms->name = "snd-soc-dummy";
+			link->platforms = NULL;
 
 			link->be_hw_params_fixup = be_hw_params_fixup;
 			link->ops = &imx_aif_ops_be;
@@ -722,8 +723,7 @@ err:
 	of_node_put(cpu);
 	of_node_put(codec);
 	of_node_put(platform);
-err_put_np:
-	of_node_put(np);
+
 	return ret;
 }
 
@@ -772,6 +772,8 @@ static int imx_card_probe(struct platform_device *pdev)
 				data->dapm_routes[i].sink =
 					devm_kasprintf(&pdev->dev, GFP_KERNEL, "%d %s",
 						       i + 1, "Playback");
+				if (!data->dapm_routes[i].sink)
+					return -ENOMEM;
 				data->dapm_routes[i].source = "CPU-Playback";
 			}
 		}
@@ -789,6 +791,8 @@ static int imx_card_probe(struct platform_device *pdev)
 				data->dapm_routes[i].source =
 					devm_kasprintf(&pdev->dev, GFP_KERNEL, "%d %s",
 						       i + 1, "Capture");
+				if (!data->dapm_routes[i].source)
+					return -ENOMEM;
 				data->dapm_routes[i].sink = "CPU-Capture";
 			}
 		}

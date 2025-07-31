@@ -58,12 +58,10 @@ static inline void ksmbd_tcp_reuseaddr(struct socket *sock)
 
 static inline void ksmbd_tcp_rcv_timeout(struct socket *sock, s64 secs)
 {
-	lock_sock(sock->sk);
 	if (secs && secs < MAX_SCHEDULE_TIMEOUT / HZ - 1)
-		sock->sk->sk_rcvtimeo = secs * HZ;
+		WRITE_ONCE(sock->sk->sk_rcvtimeo, secs * HZ);
 	else
-		sock->sk->sk_rcvtimeo = MAX_SCHEDULE_TIMEOUT;
-	release_sock(sock->sk);
+		WRITE_ONCE(sock->sk->sk_rcvtimeo, MAX_SCHEDULE_TIMEOUT);
 }
 
 static inline void ksmbd_tcp_snd_timeout(struct socket *sock, s64 secs)
@@ -93,15 +91,19 @@ static struct tcp_transport *alloc_transport(struct socket *client_sk)
 	return t;
 }
 
+static void ksmbd_tcp_free_transport(struct ksmbd_transport *kt)
+{
+	struct tcp_transport *t = TCP_TRANS(kt);
+
+	sock_release(t->sock);
+	kfree(t->iov);
+	kfree(t);
+}
+
 static void free_transport(struct tcp_transport *t)
 {
 	kernel_sock_shutdown(t->sock, SHUT_RDWR);
-	sock_release(t->sock);
-	t->sock = NULL;
-
 	ksmbd_conn_free(KSMBD_TRANS(t)->conn);
-	kfree(t->iov);
-	kfree(t);
 }
 
 /**
@@ -652,4 +654,5 @@ static const struct ksmbd_transport_ops ksmbd_tcp_transport_ops = {
 	.read		= ksmbd_tcp_read,
 	.writev		= ksmbd_tcp_writev,
 	.disconnect	= ksmbd_tcp_disconnect,
+	.free_transport = ksmbd_tcp_free_transport,
 };

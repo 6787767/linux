@@ -8,8 +8,6 @@
 use super::{lock::Backend, lock::Guard, LockClassKey};
 use crate::{
     ffi::{c_int, c_long},
-    init::PinInit,
-    pin_init,
     str::CStr,
     task::{
         MAX_SCHEDULE_TIMEOUT, TASK_FREEZABLE, TASK_INTERRUPTIBLE, TASK_NORMAL, TASK_UNINTERRUPTIBLE,
@@ -18,7 +16,7 @@ use crate::{
     types::Opaque,
 };
 use core::{marker::PhantomPinned, pin::Pin, ptr};
-use macros::pin_data;
+use pin_init::{pin_data, pin_init, PinInit};
 
 /// Creates a [`CondVar`] initialiser with the given name and a newly-created lock class.
 #[macro_export]
@@ -38,7 +36,7 @@ pub use new_condvar;
 /// spuriously.
 ///
 /// Instances of [`CondVar`] need a lock class and to be pinned. The recommended way to create such
-/// instances is with the [`pin_init`](crate::pin_init) and [`new_condvar`] macros.
+/// instances is with the [`pin_init`](crate::pin_init!) and [`new_condvar`] macros.
 ///
 /// # Examples
 ///
@@ -218,6 +216,7 @@ impl CondVar {
     /// This method behaves like `notify_one`, except that it hints to the scheduler that the
     /// current thread is about to go to sleep, so it should schedule the target thread on the same
     /// CPU.
+    #[inline]
     pub fn notify_sync(&self) {
         // SAFETY: `wait_queue_head` points to valid memory.
         unsafe { bindings::__wake_up_sync(self.wait_queue_head.get(), TASK_NORMAL) };
@@ -227,6 +226,7 @@ impl CondVar {
     ///
     /// This is not 'sticky' in the sense that if no thread is waiting, the notification is lost
     /// completely (as opposed to automatically waking up the next waiter).
+    #[inline]
     pub fn notify_one(&self) {
         self.notify(1);
     }
@@ -235,6 +235,7 @@ impl CondVar {
     ///
     /// This is not 'sticky' in the sense that if no thread is waiting, the notification is lost
     /// completely (as opposed to automatically waking up the next waiter).
+    #[inline]
     pub fn notify_all(&self) {
         self.notify(0);
     }

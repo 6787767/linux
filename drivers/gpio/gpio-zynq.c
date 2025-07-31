@@ -265,8 +265,8 @@ static int zynq_gpio_get_value(struct gpio_chip *chip, unsigned int pin)
  * upper 16 bits) based on the given pin number and sets the state of a
  * gpio pin to the specified value. The state is either 0 or non-zero.
  */
-static void zynq_gpio_set_value(struct gpio_chip *chip, unsigned int pin,
-				int state)
+static int zynq_gpio_set_value(struct gpio_chip *chip, unsigned int pin,
+			       int state)
 {
 	unsigned int reg_offset, bank_num, bank_pin_num;
 	struct zynq_gpio *gpio = gpiochip_get_data(chip);
@@ -290,6 +290,8 @@ static void zynq_gpio_set_value(struct gpio_chip *chip, unsigned int pin,
 		((state << bank_pin_num) | ZYNQ_GPIO_UPPER_MASK);
 
 	writel_relaxed(state, gpio->base_addr + reg_offset);
+
+	return 0;
 }
 
 /**
@@ -930,7 +932,7 @@ static int zynq_gpio_probe(struct platform_device *pdev)
 	chip->owner = THIS_MODULE;
 	chip->parent = &pdev->dev;
 	chip->get = zynq_gpio_get_value;
-	chip->set = zynq_gpio_set_value;
+	chip->set_rv = zynq_gpio_set_value;
 	chip->request = zynq_gpio_request;
 	chip->free = zynq_gpio_free;
 	chip->direction_input = zynq_gpio_dir_in;
@@ -1011,6 +1013,7 @@ static void zynq_gpio_remove(struct platform_device *pdev)
 	ret = pm_runtime_get_sync(&pdev->dev);
 	if (ret < 0)
 		dev_warn(&pdev->dev, "pm_runtime_get_sync() Failed\n");
+	device_init_wakeup(&pdev->dev, 0);
 	gpiochip_remove(&gpio->chip);
 	device_set_wakeup_capable(&pdev->dev, 0);
 	pm_runtime_disable(&pdev->dev);

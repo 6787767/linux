@@ -108,14 +108,16 @@ struct hbg_irq_info {
 	bool re_enable;
 	bool need_print;
 	bool need_reset;
-	u64 count;
 
-	void (*irq_handle)(struct hbg_priv *priv, struct hbg_irq_info *info);
+	void (*irq_handle)(struct hbg_priv *priv,
+			   const struct hbg_irq_info *info);
 };
 
 struct hbg_vector {
 	char name[HBG_VECTOR_NUM][32];
-	struct hbg_irq_info *info_array;
+
+	u64 *stats_array;
+	const struct hbg_irq_info *info_array;
 	u32 info_array_len;
 };
 
@@ -256,6 +258,7 @@ struct hbg_stats {
 	u64 tx_dma_err_cnt;
 
 	u64 np_link_fail_cnt;
+	u64 reset_fail_cnt;
 };
 
 struct hbg_priv {

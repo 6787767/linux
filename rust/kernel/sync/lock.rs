@@ -7,13 +7,11 @@
 
 use super::LockClassKey;
 use crate::{
-    init::PinInit,
-    pin_init,
     str::CStr,
     types::{NotThreadSafe, Opaque, ScopeGuard},
 };
 use core::{cell::UnsafeCell, marker::PhantomPinned, pin::Pin};
-use macros::pin_data;
+use pin_init::{pin_data, pin_init, PinInit};
 
 pub mod mutex;
 pub mod spinlock;
@@ -177,6 +175,8 @@ impl<T: ?Sized, B: Backend> Lock<T, B> {
     /// Tries to acquire the lock.
     ///
     /// Returns a guard that can be used to access the data protected by the lock if successful.
+    // `Option<T>` is not `#[must_use]` even if `T` is, thus the attribute is needed here.
+    #[must_use = "if unused, the lock will be immediately unlocked"]
     pub fn try_lock(&self) -> Option<Guard<'_, T, B>> {
         // SAFETY: The constructor of the type calls `init`, so the existence of the object proves
         // that `init` was called.
@@ -208,7 +208,8 @@ impl<'a, T: ?Sized, B: Backend> Guard<'a, T, B> {
     /// lock is held.
     ///
     /// ```
-    /// # use kernel::{new_spinlock, stack_pin_init, sync::lock::{Backend, Guard, Lock}};
+    /// # use kernel::{new_spinlock, sync::lock::{Backend, Guard, Lock}};
+    /// # use pin_init::stack_pin_init;
     ///
     /// fn assert_held<T, B: Backend>(guard: &Guard<'_, T, B>, lock: &Lock<T, B>) {
     ///     // Address-equal means the same lock.

@@ -64,6 +64,7 @@ struct dev_printk_info;
 
 extern struct printk_ringbuffer *prb;
 extern bool printk_kthreads_running;
+extern bool debug_non_panic_cpus;
 
 __printf(4, 0)
 int vprintk_store(int facility, int level,
@@ -71,7 +72,6 @@ int vprintk_store(int facility, int level,
 		  const char *fmt, va_list args);
 
 __printf(1, 0) int vprintk_default(const char *fmt, va_list args);
-__printf(1, 0) int vprintk_deferred(const char *fmt, va_list args);
 
 void __printk_safe_enter(void);
 void __printk_safe_exit(void);

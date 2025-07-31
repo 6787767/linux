@@ -89,12 +89,12 @@ enum {
 };
 
 static const struct fs_parameter_spec devpts_param_specs[] = {
-	fsparam_u32	("gid",		Opt_gid),
+	fsparam_gid	("gid",		Opt_gid),
 	fsparam_s32	("max",		Opt_max),
 	fsparam_u32oct	("mode",	Opt_mode),
 	fsparam_flag	("newinstance",	Opt_newinstance),
 	fsparam_u32oct	("ptmxmode",	Opt_ptmxmode),
-	fsparam_u32	("uid",		Opt_uid),
+	fsparam_uid	("uid",		Opt_uid),
 	{}
 };
 
@@ -381,7 +381,7 @@ static int devpts_fill_super(struct super_block *s, struct fs_context *fc)
 	s->s_blocksize_bits = 10;
 	s->s_magic = DEVPTS_SUPER_MAGIC;
 	s->s_op = &devpts_sops;
-	s->s_d_op = &simple_dentry_operations;
+	s->s_d_flags = DCACHE_DONTCACHE;
 	s->s_time_gran = 1;
 	fsi->sb = s;
 
